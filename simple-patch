@@ -1,0 +1,937 @@
+#!/usr/bin/perl -w
+# -*-perl-*-
+use strict;
+
+use IO::File;
+use IO::Handle;
+
+# I cannot get patch to do what I want so I wrote this script to do
+# it.  I must admit that there is something quite ironic about writing
+# patch in perl; I want to expect the perl interpreter to say "hey,
+# this is Larry, I wrote patch already!"
+
+# This program applies a diff to a file or directory; we expect a
+# unified diff output on two files or two directories, what you get
+# from diff -u or diff -u -r.  Does not allow any fuzz in patching;
+# further if a chunk fails, the whole diff fails; thus no .orig file
+# is created but a .rej file is.
+
+# Daniel S. Wilkerson
+
+# **** license
+
+# Copyright (c) 2006 Regents of the University of California
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#
+#     Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer. 
+#     Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the
+#     distribution.
+#
+#     Neither the name of the University of California, Berkeley nor the
+#     names of its contributors may be used to endorse or promote
+#     products derived from this software without specific prior written
+#     permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# **** schema
+
+# a diff of two directories results in a series of file pairs
+# a diff of two files results in one file pair
+# a file pair is a series of chunks
+
+# **** state
+
+# command-line state
+my $startdir;                   # directory to cd to before starting
+my $which_input;                # which input file to use in a file-pair
+my $diff;                       # the input diff file
+my $input_re;                   # filter the input file name
+my $print_diff;                 # print out the diff file
+my $print_diff_plain;           # used with --print-diff, print context and pos|neg as plaintext
+my $apply_diff;                 # apply the diff
+my $concat_substitute;          # substitute when input_name collisions arise
+my $output_name = 's/$/.new/';  # compute output name where input is in $_
+my $no_patch_output;            # bool: if true, don't print any patch output
+my $try_no_context;             # bool: if mismatch, try again with no context; confirm
+my $comment;                    # make comments on internal state
+
+# line-reading state
+my $diff_file;                  # file handle on input diff file
+my $line;                       # last line read
+my $pushedback;                 # bool: return the same line again?
+my $done;                       # bool: true at eof
+
+# file-pair state
+my $diff_splash;                # diff line in directory diffs; redundant
+my $neg_file;                   # filename patching from
+my $neg_datestamp;
+my $pos_file;                   # filename patching to
+my $pos_datestamp;
+my @chunks;
+
+# chunk state
+my $neg_start;                  # range replaced in neg file
+my $neg_length;
+my $pos_start;                  # range replaced in pos file
+my $pos_length;
+my $ctxt0;                      # number of lines of leading context
+my $ctxt1;                      # number of lines of trailing context
+my @leading_ctxt;               # shared leading ctxt
+my @core_neg;                   # just the neg part
+my @core_pos;                   # just the pos part
+my @trailing_ctxt;              # shared trailing ctxt
+
+# diff file state
+my @file_pairs;                 # global list of stored file-pairs
+my %fpinput_name2fp_index;      # map from the file-pair input name to its index in @file_pairs
+
+# apply state
+my $input_file;                 # actual file we are patching
+my $output_file;                # actual file to which we are printing patched input
+my @file_contents;              # the contents of the file we are modifying
+my %pos_repl;                   # pos repl blocks in neg-file coords
+my %neg_start2pos_start;        # pos repl block start pos in neg-file coords
+my %input_files_seen;           # files we have replaced
+my %not_apply_cleanly;          # files to which the patch did not apply cleanly
+my %applied_without_context;    # those that did get fixed without context
+my $exit_status = 0;            # exit status of the process
+
+# **** command-line
+
+sub read_command_line {
+    while (1) {
+        my $arg = shift @ARGV;
+        last unless defined $arg;
+        if (0) {                # orthogonality
+        } elsif ($arg =~ m/^--startdir=(.*)$/) {
+            $startdir = $1;
+        } elsif ($arg =~ m/^--comment$/) {
+            ++$comment;
+        } elsif ($arg =~ m/^--which-input=(.*)$/) {
+            $which_input = $1;
+        } elsif ($arg =~ m/^--diff=(.*)$/) {
+            $diff = $1;
+        } elsif ($arg =~ m/^--input-re=(.*)$/) {
+            $input_re = $1;
+        } elsif ($arg =~ m/^--print-diff$/) {
+            ++$print_diff;
+        } elsif ($arg =~ m/^--print-diff-plain=(.*)$/) {
+            $print_diff_plain = $1;
+        } elsif ($arg =~ m/^--apply-diff$/) {
+            ++$apply_diff;
+        } elsif ($arg =~ m/^--concat-substitute$/) {
+            ++$concat_substitute;
+        } elsif ($arg =~ m/^--output-name=(.*)$/) {
+            $output_name = $1;
+        } elsif ($arg =~ m/^--out-replaces-input$/) {
+            $output_name = '1'; # that is, do nothing
+        } elsif ($arg =~ m/^--no-patch-output$/) {
+            ++$no_patch_output;
+        } elsif ($arg =~ m/^--try-no-context$/) {
+            ++$try_no_context;
+        } elsif ($arg =~ m/^--help$/) {
+            print_usage();
+            exit(1);
+        } elsif ($arg =~ m/^-h$/) {
+            print_usage();
+            exit(1);
+        } else {
+            die "illegal command line argument: $arg\n";
+        }
+    }
+    # check integrity
+    die "do not use --print-diff if you use --apply-diff"
+        if $print_diff && $apply_diff;
+    die "--print-diff-plain useless without --print-diff"
+        if (! $print_diff) && defined $print_diff_plain;
+    unless (defined $print_diff_plain) {
+        die "--which-input is a mandatory flag unless using --print-diff-plain\n"
+            unless $which_input;
+        die "--which-input must be 'neg' or 'pos'"
+            unless $which_input eq 'neg' || $which_input eq 'pos';
+    }
+    die "--diff is a mandatory flag"
+        unless defined $diff;
+}
+
+sub print_usage {
+    print STDERR <<"END0"
+usage: $0 --which-input=neg|pos --diff=PATCH
+  where PATCH is the patch file.
+mandatory flags:
+  --diff=FILE     : the input diff file
+if you want any external effect, pick at most one of the following:
+  --print-diff    : print out the diff file; same for simple chunks
+  --apply-diff    : apply the diff file
+which can be modified by these:
+  --print-diff-plain=pos|neg : used with --print-diff, print context and pos|neg as plaintext
+  --which-input=neg|pos : use the neg or pos filename as the input file; mandatory with --apply-diff
+more optional flags:
+  --input-re=RE   : regex to select part of the input file; INCLUDE 1 PAIR OF PARENS
+  --concat-substitute : concat diff files and replace old file pairs with new ones
+  --output-name   : compute output name where input is in \$\_: default: $output_name
+  --out-replaces-input : send patched output to input file
+  --no-patch-output : do not print any patch output
+  --startdir=DIR  : a directory to cd to before starting
+  --help or -h    : print this message
+END0
+;
+}
+
+sub print_command_state {
+    warn "state:\n";
+    warn "\tstartdir: ";
+    if (defined $startdir) {
+        warn "$startdir\n";
+    } else {
+        warn "undefined\n";
+    }
+    warn "\tprint-diff: $print_diff";
+    warn "\tapply-diff: $apply_diff";
+    # FIX: missing some flags here
+    warn "------\n\n";         # extra newline to break up blocks
+}
+
+# **** line-reading
+
+# get a line with pushback capability; note that you can push back the
+# end-of-file
+sub get_line {
+    my ($l0) = @_;
+    warn "get_line:$l0\n" if $comment;
+    if ($pushedback) {
+        undef $pushedback;
+        if (!$done) {
+            die "$.: internal error -- line not defined during read from pushback and not at eof\n"
+                unless defined $line;
+        }
+    } else {
+        undef $line;
+        die "internal error -- tried to get line when done\n" if $done;
+        if (eof $diff_file) {
+            $done = 1;
+            die "control -- eof\n";
+        } else {
+            $line = <$diff_file>;
+        }
+    }
+    return $line;
+}
+
+# **** state management
+
+sub clear_filepair_state {
+    undef $diff_splash;
+    undef $neg_file;
+    undef $neg_datestamp;
+    undef $pos_file;
+    undef $pos_datestamp;
+    undef @chunks;
+    clear_chunk_state();
+}
+
+sub load_filepair_state {
+    my ($file_pair) = @_;
+    die "undefined argument to load_filepair_state\n" unless defined $file_pair;
+    clear_filepair_state();
+    $diff_splash   = $$file_pair{'diff_splash'};
+    $neg_file      = $$file_pair{'neg_file'};
+    $neg_datestamp = $$file_pair{'neg_datestamp'};
+    $pos_file      = $$file_pair{'pos_file'};
+    $pos_datestamp = $$file_pair{'pos_datestamp'};
+    @chunks        = @{$$file_pair{'chunks'}};
+}
+
+sub new_filepair_state {
+    return {
+        diff_splash   => $diff_splash,
+        neg_file      => $neg_file,
+        neg_datestamp => $neg_datestamp,
+        pos_file      => $pos_file,
+        pos_datestamp => $pos_datestamp,
+        chunks        => [ @chunks ],
+    };
+}
+
+sub clear_chunk_state {
+    undef $neg_start;
+    undef $neg_length;
+    undef $pos_start;
+    undef $pos_length;
+    undef $ctxt0;
+    undef $ctxt1;
+    undef @leading_ctxt;
+    undef @core_neg;
+    undef @core_pos;
+    undef @trailing_ctxt;
+}
+
+sub load_chunk_state {
+    my ($chunk) = @_;
+    die "undefined argument to load_chunk_state\n" unless defined $chunk;
+    clear_chunk_state();
+    $neg_start     = $$chunk{'neg_start'};
+    $neg_length    = $$chunk{'neg_length'};
+    $pos_start     = $$chunk{'pos_start'};
+    $pos_length    = $$chunk{'pos_length'};
+    $ctxt0         = $$chunk{'ctxt0'};
+    $ctxt1         = $$chunk{'ctxt1'};
+    @leading_ctxt  = @{$$chunk{'leading_ctxt'}};
+    @core_neg      = @{$$chunk{'core_neg'}};
+    @core_pos      = @{$$chunk{'core_pos'}};
+    @trailing_ctxt = @{$$chunk{'trailing_ctxt'}};
+
+    # check integrity
+    die sprintf("$.: interal error -- count mismatch neg_length:%d == " .
+                "scalar \@leading_ctxt:%d + scalar \@core_neg:%d + scalar \@trailing_ctxt:%d",
+                $neg_length, scalar @leading_ctxt, scalar @core_neg, scalar @trailing_ctxt)
+        unless $neg_length == scalar @leading_ctxt + scalar @core_neg + scalar @trailing_ctxt;
+    die sprintf("$.: interal error -- count mismatch pos_length:%d == " .
+                "scalar \@leading_ctxt:%d + scalar \@core_pos:%d + scalar \@trailing_ctxt:%d",
+                $pos_length, scalar @leading_ctxt, scalar @core_pos, scalar @trailing_ctxt)
+        unless $pos_length == scalar @leading_ctxt + scalar @core_pos + scalar @trailing_ctxt;
+
+}
+
+sub new_chunk_state {
+    return {
+        neg_start     => $neg_start,
+        neg_length    => $neg_length,
+        pos_start     => $pos_start,
+        pos_length    => $pos_length,
+        ctxt0         => $ctxt0,
+        ctxt1         => $ctxt1,
+        leading_ctxt  => [ @leading_ctxt ],
+        core_neg      => [ @core_neg ],
+        core_pos      => [ @core_pos ],
+        trailing_ctxt => [ @trailing_ctxt ],
+    };
+}
+
+sub clear_apply_state {
+    undef $input_file;
+    undef $output_file;
+    undef @file_contents;
+    undef %pos_repl;
+    undef %neg_start2pos_start;
+}
+
+# **** parsing
+
+sub parse_preamble {
+    # save this kind of line: diff -r -u dir1 dir2
+    # skip this kind of line: Only in
+    while(1) {
+        get_line(1);
+        if (0) {                # orthogonality
+        } elsif ($line =~ m/^$/) {
+            # skip blank lines
+        } elsif ($line =~ m/^Property changes on:/) {
+            # svn diff puts properties at the end of files; skip them:
+            # Property changes on: trunk/linkage.h
+            # ___________________________________________________________________
+            # Name: svn:keywords
+            #    + Author Date Id Revision
+            # Name: svn:eol-style
+            #    + native                                                                     
+            while(1) {
+                get_line('0.1');
+                last if ($line =~ m/^$/);
+            }
+        } elsif ($line =~ m/^Index: /) {
+            $diff_splash .= $line;
+        } elsif ($line =~ m/^[=]{67}/) {
+            $diff_splash .= $line;
+        } elsif ($line =~ m/^diff/) {
+            $diff_splash .= $line;
+        } elsif ($line =~ m/^diff/) {
+            $diff_splash .= $line;
+        } elsif ($line =~ m/^Only in/) {
+            # skip this line
+        } else {
+            # otherwise, read it again later
+            ++$pushedback;
+            last;
+        }
+    }
+
+    # read this kind of line: --- file timestamp
+    get_line(2);
+    die "$.: format error -- line should start with '---': $line\n"
+        unless $line =~ m/^[-][-][-] (\S+)\t(.*)$/;
+    ($neg_file, $neg_datestamp) = ($1, $2);
+
+    # read this kind of line: +++ file timestamp
+    get_line(3);
+    die "$.: format error -- line should start with '+++': $line\n"
+        unless $line =~ m/^[+][+][+] (\S+)\t(.*)$/;
+    ($pos_file, $pos_datestamp) = ($1, $2);
+}
+
+sub parse_chunk {
+    clear_chunk_state();
+
+    # read this kind of line: @@ -1,3 +1,5 @@
+    get_line(4);
+    if (defined $line && $line =~ m/^\@\@ [-](\d+),(\d+) [+](\d+),(\d+) \@\@$/) {
+        ($neg_start, $neg_length, $pos_start, $pos_length) = ($1, $2, $3, $4);
+    } else {
+        $pushedback = 1;        # re-read later
+        die "control -- line counts do not delimit chunk\n";
+    }
+
+    # read the chunk data
+    my @neg_block;
+    my @pos_block;
+    my $neg_block_length;
+    my $pos_block_length;
+
+    # track leading and trailing shared context; NOTE: this is a
+    # simple approximation to the leading and trailing context removes
+    # all possibility of intermediate lines of context; this behavior
+    # is identical to diff only for simple chunks not complex ones
+    # with intermediate lines of context; to imitate diff in general
+    # would be to re-implement diff; I consider this to be a feature
+    # not a bug as that way you get simply one negative block
+    # substituted for one positive one; it is simpler
+    my $ctxt_run_len = 0;
+    my $ctxt0;                  # leading context
+    # trailing context, $ctxt1, is below
+
+    eval {
+        while(1) {              # inner loop
+            $neg_block_length = 0+@neg_block;
+            $pos_block_length = 0+@pos_block;
+
+            # check if we are done
+            my $neg_done = ($neg_block_length >= $neg_length);
+            my $pos_done = ($pos_block_length >= $pos_length);
+            last if $neg_done && $pos_done;
+
+            get_line(5);
+            if (0) {            # orthogonality
+            } elsif ($line =~ m/^[ ]/) {
+                die "$.: format error -- neg done but not pos" if $neg_done;
+                die "$.: format error -- pos done but not neg" if $pos_done;
+                $line =~ s/^.// or die; # chop the first char
+                push @neg_block, $line;
+                push @pos_block, $line;
+                ++$ctxt_run_len;
+            } elsif ($line =~ m/^[+]/) {
+                die "$.: format error -- pos done but not neg" if $pos_done;
+                $line =~ s/^.// or die; # chop the first char
+                push @pos_block, $line;
+                $ctxt0 = $ctxt_run_len unless defined $ctxt0;
+                $ctxt_run_len = 0; # don't undef it
+            } elsif ($line =~ m/^[-]/) {
+                die "$.: format error -- neg done but not pos" if $neg_done;
+                $line =~ s/^.// or die; # chop the first char
+                push @neg_block, $line;
+                $ctxt0 = $ctxt_run_len unless defined $ctxt0;
+                $ctxt_run_len = 0; # don't undef it
+            } else {
+                die "format error -- illegal chunk line: '$line'";
+            }
+        }
+    };
+    if ($@) {
+        if ($@ =~ m/^control -- eof$/) {
+            ++$pushedback;      # pushback the eof
+            # fallthrough
+        } else {die $@}
+    }
+    die "format error -- whole chunk is context only, no neg or pos lines" unless defined $ctxt0;
+    my $ctxt1 = $ctxt_run_len;
+
+    # check lengths
+    $neg_block_length = 0+@neg_block;
+    $pos_block_length = 0+@pos_block;
+    # these are now checked above
+    die "$.: internal error -- neg length $neg_length doesn't match data $neg_block_length\n"
+        unless $neg_block_length == $neg_length;
+    die "$.: internal error -- pos length $pos_length doesn't match data $pos_block_length\n"
+        unless $pos_block_length == $pos_length;
+
+    # check context lengths
+    for (my $i0=0; $i0<$ctxt0; ++$i0) {
+        die "internal error"
+            unless $neg_block[$i0] eq $pos_block[$i0];
+    }
+    for (my $i1=0; $i1<$ctxt1; ++$i1) {
+        die "internal error"
+            unless $neg_block[$neg_length -$i1 -1] eq $pos_block[$pos_length -$i1 -1];
+    }
+
+    # transform into parts
+    #
+    # leading context
+    @leading_ctxt = ();
+    my $k = 0;
+    for (; $k<$ctxt0; ++$k) {
+        die unless defined $neg_block[$k];
+        die unless $neg_block[$k] eq $pos_block[$k];
+        push @leading_ctxt, $neg_block[$k];
+    }
+    # core neg
+    @core_neg = ();
+    my $save_k = $k;
+    for (; $k<$neg_length - $ctxt1; ++$k) {
+        die unless defined $neg_block[$k];
+        push @core_neg, $neg_block[$k];
+    }
+    # core pos
+    @core_pos = ();
+    $k = $save_k;
+    for (; $k<$pos_length - $ctxt1; ++$k) {
+        die unless defined $pos_block[$k];
+        push @core_pos, $pos_block[$k];
+    }
+    # trailing context
+    @trailing_ctxt = ();
+    $k = $neg_length - $ctxt1;
+    for (; $k<$neg_length; ++$k) {
+        die unless defined $neg_block[$k];
+        die unless $neg_block[$k] eq $pos_block[$k - $neg_length + $pos_length];
+        push @trailing_ctxt, $neg_block[$k];
+    }
+
+    # check integrity
+    die sprintf("$.: interal error -- count mismatch neg_length:%d == " .
+                "scalar \@leading_ctxt:%d + scalar \@core_neg:%d + scalar \@trailing_ctxt:%d",
+                $neg_length, scalar @leading_ctxt, scalar @core_neg, scalar @trailing_ctxt)
+        unless $neg_length == scalar @leading_ctxt + scalar @core_neg + scalar @trailing_ctxt;
+    die sprintf("$.: interal error -- count mismatch pos_length:%d == " .
+                "scalar \@leading_ctxt:%d + scalar \@core_pos:%d + scalar \@trailing_ctxt:%d",
+                $pos_length, scalar @leading_ctxt, scalar @core_pos, scalar @trailing_ctxt)
+        unless $pos_length == scalar @leading_ctxt + scalar @core_pos + scalar @trailing_ctxt;
+
+    # save chunk
+    push @chunks, new_chunk_state();
+}
+
+sub parse_file_pair {
+    clear_filepair_state();
+    parse_preamble();
+
+    # loop over all the chunks; get them and patch with them
+    eval {
+        while(1) {
+            parse_chunk();
+        }
+    };
+    if ($@) {
+        if ($@ =~ m/^control -- line counts do not delimit chunk$/) {
+            # fallthrough
+        } elsif ($@ =~ m/^control -- eof$/) {
+            # fallthrough
+        } else {die $@}
+    }
+
+    # check if this file pair's input name collides with that of a
+    # previous file pair; this is a bug unless the --concat-substitute
+    # flag is on in which case it is a feature
+    $input_file = compute_input_file();
+    if (defined $fpinput_name2fp_index{$input_file}) {
+        # a file-pair with the same input file name occured before
+
+        # check that it is so; wow is this scary
+        my $temp_fp_state = new_filepair_state();
+        load_filepair_state($file_pairs[$fpinput_name2fp_index{$input_file}]);
+        my $input_file2 = compute_input_file();
+        die "internal error -- file pair names don't match: $input_file and $input_file2\n"
+            unless $input_file eq $input_file2;
+        load_filepair_state($temp_fp_state);
+
+        if ($concat_substitute) {
+            # delete old one
+            warn "\tsubstituting new file-pair for $input_file\n";
+            undef $file_pairs[$fpinput_name2fp_index{$input_file}];
+            undef $fpinput_name2fp_index{$input_file};
+        } else {
+            die "$.: duplicated file-pair with the same input file name: $input_file\n";
+        }
+    }
+
+    # save file pair
+    my $file_pair_state = new_filepair_state();
+    die "internal error -- fpinput_name2fp_index" if defined $fpinput_name2fp_index{$input_file};
+    $fpinput_name2fp_index{$input_file} = 0+@file_pairs;
+    push @file_pairs, $file_pair_state;
+    die "internal error -- fpinput_name2fp_index"
+        unless $file_pairs[$fpinput_name2fp_index{$input_file}] == $file_pair_state;
+}
+
+# **** print
+
+sub print_chunk {
+    my ($chunk, $outfile) = @_;
+    die unless defined $chunk;
+    die unless defined $outfile;
+    load_chunk_state($chunk);
+    print $outfile "@@ -$neg_start,$neg_length +$pos_start,$pos_length @@\n";
+    my $l0;
+    for $l0 (@leading_ctxt) {
+        print $outfile ' ' unless defined $print_diff_plain;
+        print $outfile $l0;
+    }
+    if (!defined $print_diff_plain || $print_diff_plain eq 'neg') {
+        for $l0 (@core_neg) {
+            print $outfile '-' unless defined $print_diff_plain;
+            print $outfile $l0;
+        }
+    }
+    if (!defined $print_diff_plain || $print_diff_plain eq 'pos') {
+        for $l0 (@core_pos) {
+            print $outfile '+' unless defined $print_diff_plain;
+            print $outfile $l0;
+        }
+    }
+    for $l0 (@trailing_ctxt) {
+        print $outfile ' ' unless defined $print_diff_plain;
+        print $outfile $l0;
+    }
+}
+
+sub print_one_file_pair {
+    my ($file_pair, $outfile) = @_;
+    die unless defined $file_pair;
+    die unless defined $outfile;
+    load_filepair_state($file_pair);
+    print $outfile $diff_splash if defined $diff_splash;
+    print $outfile "--- $neg_file\t$neg_datestamp\n";
+    print $outfile "+++ $pos_file\t$pos_datestamp\n";
+    for my $chunk (@chunks) {
+        print_chunk($chunk, $outfile);
+    }
+}
+
+sub print_file_pairs {
+    my ($outfile) = @_;
+    die unless defined $outfile;
+    for my $file_pair (@file_pairs) {
+        # --concat-substitute can cause this to happen
+        next unless defined $file_pair;
+        print_one_file_pair($file_pair, $outfile);
+    }
+}
+
+# **** apply
+
+sub get_file_contents {
+    open  INPUT_FILE, $input_file or die "$.: can't open input_file $input_file: $!\n";
+    @file_contents = <INPUT_FILE>;
+    unshift @file_contents, undef; # diff starts counting at 1
+    close INPUT_FILE or die "$.: can't close input_file $input_file: $!\n";
+}
+
+sub compute_input_file {
+    my $ret;
+    if (! defined $which_input) {
+        die "--which-input is a mandatory flag unless using --print-diff-plain\n"
+            unless defined $print_diff_plain;
+        # need some sort of name, but don't want something that will
+        # occur in the filesystem in case there is some bug
+        $ret = "$neg_file and $pos_file";
+    } elsif ($which_input eq 'neg') {
+        $ret = $neg_file;
+    } elsif ($which_input eq 'pos') {
+        $ret = $pos_file;
+    } else {
+        die "interal error";
+    }
+    if (defined $input_re) {
+        # this is just too weird
+        die "don't use --input-re and --print-diff-plain"
+            if defined $print_diff_plain;
+        if ($ret =~ m/${input_re}/) {
+            die "--input-re does not match an acceptable substring: string: '$ret'"
+                unless $1;
+            $ret = $1;
+        } else {
+            die "$which_input file '$ret' does not match input-re '$input_re'\n";
+        }
+    }
+    return $ret;
+}
+
+sub compute_output_file {
+    die "internal error -- no input file\n" unless defined $input_file;
+    local $_ = $input_file;
+    eval $output_name;
+    if ($@) {
+        die "error running --output-name '$output_name' on '$input_file': $@";
+    }
+    return $_;
+}
+
+sub check_chunk_applies {
+    my ($neg_block0_ref, $pos_block0_ref, $neg_start0, $pos_start0) = @_;
+    die unless defined $neg_block0_ref;
+    die unless defined $pos_block0_ref;
+    die unless defined $neg_start0;
+    die unless defined $pos_start0;
+    my @neg_block0 = @{$neg_block0_ref};
+    my @pos_block0 = @{$pos_block0_ref};
+
+    my %remove;
+    for (my $i0=0; $i0<@neg_block0; ++$i0) {
+        my $i = $neg_start0 + $i0;
+        if (! defined $file_contents[$i]) {
+            die "$.: patch does not apply cleanly: patch chunks overlap\n";
+        }
+        my $a = $file_contents[$i];
+        my $b = $neg_block0[$i - $neg_start0];
+        if ($a eq $b) {
+            ++$remove{$i};      # this line to be replaced
+        } else {
+            die "$.: patch does not apply cleanly: neg and file mismatch: line $i\n";
+        }
+    }
+    return %remove;
+}
+
+sub apply_chunk {
+    my ($neg_block0_ref, $pos_block0_ref, $neg_start0, $pos_start0,
+        $remove_ref) = @_;
+    die unless defined $neg_block0_ref;
+    die unless defined $pos_block0_ref;
+    die unless defined $neg_start0;
+    die unless defined $pos_start0;
+    die unless defined $remove_ref;
+    my @neg_block0 = @{$neg_block0_ref};
+    my @pos_block0 = @{$pos_block0_ref};
+    my %remove = %{$remove_ref};
+
+    # replace
+    for my $l0 (keys %remove) {
+        undef $file_contents[$l0];
+    }
+    # file the replacement where it will be found; NOTE: using
+    # neg_start0 as the index into pos_repl is in fact correct
+    die "$.: format error -- two replacements at same location\n"
+        if defined $pos_repl{$neg_start0};
+    $pos_repl{$neg_start0} = [ @pos_block0 ];
+    $neg_start2pos_start{$neg_start0} = $pos_start0;
+}
+
+sub try_to_apply_chunk {
+    my ($chunk) = @_;
+    die unless defined $chunk;
+    load_chunk_state($chunk);
+    eval {
+        # attempt to apply entire chunk
+        my @neg_block0 = (@leading_ctxt, @core_neg, @trailing_ctxt);
+        my @pos_block0 = (@leading_ctxt, @core_pos, @trailing_ctxt);
+        my %remove = check_chunk_applies
+            (\@neg_block0, \@pos_block0, $neg_start, $pos_start);
+        apply_chunk
+            (\@neg_block0, \@pos_block0, $neg_start, $pos_start, \%remove);
+    };
+
+    if ($@) {
+        if ($@ =~ m/^(?:\d+): patch does not apply cleanly: neg and file mismatch/) {
+            warn "DOES NOT APPLY CLEANLY\n";
+            # even if we manage to apply without context, we should still exit non-zero
+            $exit_status = 1;
+            ++$not_apply_cleanly{$input_file};
+            return unless $try_no_context;
+            # if the user asked us to, try without the context
+            my $neg_start_nctxt = $neg_start + scalar @leading_ctxt;
+            my $pos_start_nctxt = $pos_start + scalar @leading_ctxt;
+            my %remove_nctxt = check_chunk_applies
+                (\@core_neg, \@core_pos, $neg_start_nctxt, $pos_start_nctxt);
+
+            # if we got here without an exception being thrown, then
+            # it did match this time without the context; confirm with
+            # the user and apply
+            my $stderr = new IO::Handle;
+            $stderr->fdopen(fileno(STDERR),"w") or die $!;
+            print STDERR "--- relevant file contents\n";
+            for (my $i=$neg_start; $i<$neg_start+$neg_length; ++$i) {
+                print STDERR $file_contents[$i];
+            }
+            print STDERR "--- chunk\n";
+            print_chunk($chunk, $stderr);
+            $stderr->flush();
+            warn "--- Does apply WITHOUT the context, so patch anyway?\n";
+            my $response = <STDIN>;
+            if ($response =~ m/^y/i) {
+                ++$applied_without_context{$input_file};
+                apply_chunk
+                    (\@core_neg, \@core_pos, $neg_start_nctxt, $pos_start_nctxt,
+                     \%remove_nctxt);
+            }
+        } else {die $@}
+    }
+}
+
+sub applying_file_pair_fails {
+    my ($file_pair) = @_;
+    warn "$@\n";
+    warn "\tNO MODIFICATIONS MADE\n";
+    unless ($no_patch_output) {
+        # print rejected file-pair to a .rej file
+        my $rej_file_name = "${output_file}.rej";
+        warn "\tentire diff file-pair saved in $rej_file_name\n";
+        die "file $rej_file_name already exists; aborting\n" if -e $rej_file_name;
+        my $outfile = IO::File->new("> $rej_file_name") or die $!;
+        print_one_file_pair($file_pair, $outfile);
+        close $outfile or die $!;
+    }
+}
+
+sub print_modified_output_file {
+    # compute max modified file length
+    my $endline = 0+@file_contents;
+    for my $i (keys %pos_repl) {
+        my $end0 = $i + 0+@{$pos_repl{$i}};
+        $endline = $end0 if $end0 > $endline;
+    }
+
+    # print the output file
+    warn "output to $output_file.\n";
+    open  OUTPUT_FILE, ">$output_file" or die "$.: can't open output file $output_file: $!\n";
+    # NOTE: we use the diff file coordinates where the first line of
+    # the file is 1
+    my $pos_j = 1;
+    die if defined $pos_repl{0};
+    die if defined $file_contents[0];
+    # apply the patch
+    for my $neg_j (1 .. $endline) {
+        if (defined $pos_repl{$neg_j}) {
+            die "format error -- block replacement location mismatch: " .
+                "position: $pos_j != block start: $neg_start2pos_start{$neg_j}\n"
+                unless $pos_j == $neg_start2pos_start{$neg_j};
+            print OUTPUT_FILE @{$pos_repl{$neg_j}};
+            $pos_j += 0+@{$pos_repl{$neg_j}};
+        }
+        if (defined $file_contents[$neg_j]) {
+            print OUTPUT_FILE $file_contents[$neg_j];
+            ++$pos_j;
+        }
+    }
+    close OUTPUT_FILE or die "$.: can't close output file $output_file: $!\n";
+}
+
+sub apply_file_pair {
+    my ($file_pair) = @_;
+    clear_apply_state();
+    load_filepair_state($file_pair);
+
+    # find the input file name
+    $input_file = compute_input_file();
+    if ($input_files_seen{$input_file}) {
+        die "we have already operated on this input file $input_file\n";
+    } else {
+        ++$input_files_seen{$input_file};
+    }
+    print STDERR "applying patch to $input_file... ";
+    if (! -f $input_file) {
+        warn "can't find $input_file so skipping.\n";
+        # NOTE: we may still exit with a zero exit code
+        return;
+    }
+
+    # find the output file name
+    $output_file = compute_output_file();
+
+    # use the chunks to modify the file
+    get_file_contents();
+    eval {
+        for my $chunk (@chunks) {
+            try_to_apply_chunk($chunk);
+        }
+    };
+    if ($@) {
+        if ($@ =~ m/^(?:\d+): patch does not apply cleanly:/) {
+            # unlike patch, skip the entire file-pair
+            applying_file_pair_fails($file_pair);
+            return;     # the rest of the body below is only if we succeeded
+        } else {die $@}
+    }
+
+    unless ($no_patch_output) {
+        print_modified_output_file();
+    }
+}
+
+# **** main
+
+eval {
+    read_command_line();
+    print_command_state() if $comment;
+    chdir $startdir if defined $startdir;
+
+    # parse the diff file
+    eval {
+        $diff_file = IO::File->new("< $diff") or die $!;
+        while(!$done) {
+            parse_file_pair();
+        }
+        close $diff_file or die $!;
+    };
+    if ($@) {
+        if ($@ =~ m/^control -- eof$/) {
+            # fallthrough
+        } else {die $@}
+    }
+
+    # print the diff file
+    if ($print_diff) {
+        my $outfile = new IO::Handle;
+        $outfile->fdopen(fileno(STDOUT),"w") or die $!;
+        if (defined $print_diff_plain) {
+            print $outfile "**** NOT A DIFF FILE; " .
+                "a plaintext '$print_diff_plain'-half of the diff\n";
+        }
+        print_file_pairs($outfile);
+        # NOTE: don't close it!
+    }
+
+    # apply the diff file
+    if ($apply_diff) {
+        for my $file_pair (@file_pairs) {
+            # --concat-substitute can cause this to happen
+            next unless defined $file_pair;
+            apply_file_pair($file_pair);
+        }
+    }
+
+    # done
+    warn "done\n" if $comment;
+    if (keys %not_apply_cleanly) {
+        print STDERR "files to which patch did not apply cleanly:\n";
+        print STDERR (join(" ", keys %not_apply_cleanly) . "\n");
+        print STDERR "ones that did not even get patched without context:\n";
+        for my $filename (keys %not_apply_cleanly) {
+            next if $applied_without_context{$filename};
+            print STDERR $filename . " ";
+        }
+        print STDERR "\n";
+        warn "done\n";
+    }
+    exit($exit_status);
+};
+if ($@) {
+    print_usage();
+    warn "\n";
+    die $@;
+}

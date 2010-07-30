@@ -1,0 +1,476 @@
+#!/usr/bin/perl -w
+# -*-perl-*-
+use strict;
+
+use Digest::MD5 qw(md5_hex);
+
+# Convert a subversion dump directory to a subversion dump file.
+# Daniel S. Wilkerson
+
+# **** license
+
+# Copyright (c) 2006 Regents of the University of California
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#
+#     Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer. 
+#     Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the
+#     distribution.
+#
+#     Neither the name of the University of California, Berkeley nor the
+#     names of its contributors may be used to endorse or promote
+#     products derived from this software without specific prior written
+#     permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# **** schema presentation in the filesystem
+
+# see the documentationat the top of svn-dump2dir for the schema
+# presentation in the filesystem
+
+# ****************
+
+my $creator = "svn-dump2dir"; # not this script; the one that creates the dir
+my $version = "1.0:2006-08-15"; # versions of the two scripts must match exactly
+my $author = "Daniel S. Wilkerson";
+
+# command-line flags
+my $source;                     # name of source dir
+my $verbose;                    # dump objects as the are complete
+my $verbose_text;               # dump node text; it is much longer
+my $comment;                    # comment on the current parsing state
+
+# directory headers
+my %metadata;
+my @format_headers;             # use a list to preserve order
+
+# **** read command line
+
+sub print_usage {
+    print << "END0";
+usage $0: --source=source-dir [flags] > svn-dump-file
+where flags are:
+  --help or -h        : print this message
+  --source=source-dir : the source dir; required
+  --verbose           : print out contents as parse
+  --comment           : comment on program state
+END0
+;
+}
+
+sub read_command_line {
+    while(@ARGV) {
+        my $arg = shift @ARGV;
+        if (0) {                # orthogonality
+        } elsif ($arg =~ m/^--source=(.*)$/) {
+            die "source already defined" if defined $source;
+            $source = $1;
+        } elsif ($arg =~ m/^-h$/) {
+            print_usage();
+            exit(1);
+        } elsif ($arg =~ m/^--help$/) {
+            print_usage();
+            exit(1);
+        } elsif ($arg =~ m/^--verbose$/) {
+            ++$verbose;
+        } elsif ($arg =~ m/^--comment$/) {
+            ++$comment;
+        } else {
+            die "illegal command line argument: $arg\n";
+        }
+    }
+    # check integrity of state
+    die "no source specified" unless defined $source;
+    die "source is not a directory: $source\n" if -e $source && ! -d $source;
+    die "source dir doesn't exist: $source\n" unless -d $source;
+}
+
+# **** parse utilities
+
+sub assert_file {
+    my ($file) = @_;
+    die "$file missing" unless -e $file;
+    die "$file not a file" unless -f $file;
+}
+
+sub get_file_contents {
+    my ($file) = @_;
+    die "no such file $file" unless -f $file;
+    my $ret;
+    open  FH_FILE, $file or die "can't open file $file: $!";
+    # FIX: there is some way to do this with 'local' that I don't remember
+    my $temp_dollar_slash = $/;
+    undef $/;
+    $ret = <FH_FILE>;
+    $/ = $temp_dollar_slash;
+    close FH_FILE or die "can't close file $file: $!";
+    return $ret;
+}
+
+# get a directory listing of all the files with a given prefix
+sub filter_dir_list {
+    my ($dir, $prefix) = @_;
+    my @ret;
+    opendir  DIR, $dir or die "can't open dir $dir: $!";
+    while(defined(my $file0 = readdir DIR)) {
+        my $file = "$dir/$file0";
+        die "something's wrong; can't see file" unless -e $file;
+        if ($file0 =~ m/^$prefix/) {
+            push @ret, $file0;
+        }
+    }
+    closedir DIR or die "can't close dir $dir: $!";
+    return @ret;
+}
+
+# **** parse
+
+sub parse_headers {
+    my ($file) = @_;
+    my @ret;                    # use a list to preserve order
+    assert_file($file);
+    open  FH_HEADERS, $file or die "can't open file $file: $!";
+    while(<FH_HEADERS>) {
+        my $line = $_;
+        chomp $line;
+        # FIX: not needed, but should I skip blank lines and allow
+        # hash end of line comments?
+        if ($line =~ m/^([^:]*):[ ]*(.*)$/) {
+            my ($key, $value) = ($1, $2);
+            push @ret, $key, $value;
+        } else {
+            die "illegal line '$line' in header file $file\n";
+        }
+    }
+    close FH_HEADERS or die "can't close file $file: $!";
+    return @ret;
+}
+
+sub parse_svn_dumpdir {
+    parse_format_header();
+    render_format_header();
+    my @ordered_revnum_list = parse_rev_list();
+    for my $revnum(@ordered_revnum_list) {
+        parse_svn_revision($revnum);
+    }
+}
+
+sub parse_format_header {
+    # there should be a Readme
+    assert_file("$source/Readme");
+    # check that the metadata versions match; this could be relaxed
+    %metadata = parse_headers("$source/Metadata");
+    if ($comment) {
+        print "Metadata\n";
+        while(my ($key, $value) = each %metadata) {
+            print "\t'$key': '$value'\n";
+        }
+        print "DONE Metadata\n";
+    }
+    die unless defined $creator;
+    die unless defined $version;
+    die unless defined $metadata{'creator'};
+    die unless defined $metadata{'version'};
+    die "creator mismatch: $metadata{'creator'} and $creator"
+        unless $metadata{'creator'} eq $creator;
+    die "version mismatch" unless $metadata{'version'} eq $version;
+    # get the file headers
+    @format_headers = parse_headers("$source/Headers");
+}
+
+# get the list of revision numbers in the directory and return them in
+# numerically increasing order by revision number (even if they don't
+# sort that way asciibetically)
+sub parse_rev_list {
+    my @revlist = filter_dir_list($source, 'revision-');
+    my %nums;                   # string version
+    my %numerical_nums;         # numerical version
+    for my $file0 (@revlist) {
+        if ($file0 =~ m/^revision-([0-9]+)$/) {
+            my $number = $1;
+            die "member of sourcedir looks like a revision but not a directory"
+                unless -d "$source/$file0";
+            ++$nums{$number};
+            # check for duplicate numerical numbers
+            die "duplicate revision number: $number" if defined $numerical_nums{0+$number};
+            ++$numerical_nums{0+$number};
+        } else {
+            die "member of sourcedir looks like a revision but number doesn't parse: $file0";
+        }
+    }
+    # sort the strings as numbers
+    return sort {$a <=> $b} keys %nums;
+}
+
+sub parse_svn_revision {
+    my ($revnum) = @_;
+    my @revprops = parse_props($revnum, "Rev-prop");
+    my $revnum_as_num = 0+$revnum;
+    print "Revision-number: $revnum_as_num\n";
+    render_content(\@revprops,
+                   undef,       # no text
+                   1            # render props even if empty
+                   );
+    render_newline();
+    my @nodelist = parse_node_list($revnum);
+    for my $nodenum (@nodelist) {
+        parse_node($revnum, $nodenum);
+    }
+}
+
+sub parse_props {
+    my ($revnum, $prefix) = @_;
+    my $revdir = "$source/revision-$revnum";
+    die "internal error -- no such directory $revdir" unless -d $revdir;
+
+    my @props_files = filter_dir_list($revdir, $prefix);
+    # the keys are *strings*, that is, any leading zeros are
+    # preserved, but they are sorted as *numbers*
+    my %propnum_to_keyfile;     # maps from *strings* as above, to whole key filenames
+    my %propnum_to_valuefile;   # maps from *strings* as above, to whole value filenames
+    for my $prop_file(@props_files) {
+        print "prop_file: '$prop_file'\n" if $comment;
+        if ($prop_file =~ m/-([0-9]+)-(key|value)$/) {
+            my ($propnum, $kv) = ($1, $2);
+            if ($kv eq 'key') {
+                print "\tkey\n" if $comment;
+                $propnum_to_keyfile{$propnum} = $prop_file;
+            } elsif ($kv eq 'value') {
+                print "\tvalue\n" if $comment;
+                $propnum_to_valuefile{$propnum} = $prop_file;
+            } else {
+                die "internal error -- can't happen\n";
+            }
+        } else {
+            die "internal error -- fails to match: $prop_file";
+        }
+    }
+
+    print "building ret\n" if $comment;
+    my @ret;
+    for my $propnum(sort {$a <=> $b} keys %propnum_to_keyfile) {
+        if ($comment) {
+            print "propnum: $propnum\n";
+            print "propnum_to_keyfile\n";
+            print(join (',', %propnum_to_keyfile)); print ",\n";
+            print "end propnum_to_keyfile\n";
+        }
+        my $key_file = $propnum_to_keyfile{$propnum};
+        die "in revision $revnum with prefix $prefix, propnum $propnum has no keyfile"
+            unless defined $key_file;
+        delete $propnum_to_keyfile{$propnum};
+        my $value_file = $propnum_to_valuefile{$propnum};
+        die "in revision $revnum with prefix $prefix, propnum $propnum has no valuefile"
+            unless defined $value_file;
+        delete $propnum_to_valuefile{$propnum};
+
+        my $key = get_file_contents("$revdir/$key_file");
+        my $value = get_file_contents("$revdir/$value_file");
+        push @ret, $key, $value;
+    }
+
+    # the first one shouldn't be possible
+    die "internal error -- in revision $revnum with prefix $prefix, didn't get to all of the keys"
+        unless 0 == 0+keys %propnum_to_keyfile;
+    die "in revision $revnum with prefix $prefix, didn't get to all of the values"
+        unless 0 == 0+values %propnum_to_valuefile;
+    return @ret;
+}
+
+# get the list of node numbers in the directory and return them in
+# numerically increasing order by revision number (even if they don't
+# sort that way asciibetically)
+sub parse_node_list {
+    my ($revnum) = @_;
+    my $revdir = "$source/revision-$revnum";
+    my @nodelist = filter_dir_list($revdir, 'node-');
+    my %nums;                   # string version
+    for my $file0 (@nodelist) {
+        if ($file0 =~ m/^node-([0-9]+)-/) {
+            my $number = $1;
+            die "member of $revdir looks like a node file but not a file: $file0"
+                unless -f "$revdir/$file0";
+            ++$nums{$number};
+        } else {
+            die "member of $revdir looks like a node file but number doesn't parse: $file0";
+        }
+    }
+    return sort {$a <=> $b} keys %nums;
+}
+
+sub parse_node {
+    my ($revnum, $nodenum) = @_;
+    my $revdir = "$source/revision-$revnum";
+    my @node_headers = parse_headers("$revdir/node-$nodenum-headers");
+    my @node_props = parse_props($revnum, "node-$nodenum-prop");
+    my %node_headers_hash = @node_headers;
+    if ($comment) {
+        print "node_headers_hash:";
+        print(join(',', %node_headers_hash) . ','); print "\n";
+    }
+    die "missing Node-path for revision $revnum node $nodenum"
+        unless defined $node_headers_hash{'Node-path'};
+    my $node_path = $node_headers_hash{'Node-path'};
+    my $node_text_file = "$revdir/text/$node_path";
+    my $node_kind = $node_headers_hash{'Node-kind'};
+    my $node_text;
+    if (defined $node_kind && $node_kind eq 'file') {
+        $node_text = get_file_contents($node_text_file);
+    }
+    my $render_empty_props = 1;
+    # special hack to be bug for bug compatible with subversion
+    my $node_action0 = $node_headers_hash{'Node-action'};
+    if ($node_action0 eq 'change' || $node_action0 eq 'delete') {
+        $render_empty_props = 0;
+    }
+    render_node(\@node_headers,
+                \@node_props,
+                (defined $node_text ? \$node_text : undef),
+                $render_empty_props);
+}
+
+sub render_node {
+    my ($node_headers_ref, $node_props_ref, $node_text_ref, $render_empty_props) = @_;
+    render_headers($node_headers_ref);
+    render_content($node_props_ref, $node_text_ref, $render_empty_props);
+    render_newline();
+    render_newline();
+}
+
+# **** render
+
+sub render_newline {
+    print "\n";
+}
+
+# FIX: this is only used in one place so maybe remove
+sub render_header {
+    my ($key, $headerref) = @_;
+    die "no such key $key in header" unless defined ${$headerref}{$key};
+    my $value = ${$headerref}{$key};
+    die "newline in value '$value'" if $value =~ m/\n/s;
+    print "$key: $value\n";
+}
+
+sub render_headers {
+    my ($node_headers_ref) = @_;
+    while (1) {
+        my $key = shift @{$node_headers_ref};
+        last unless defined $key;
+        my $value = shift @{$node_headers_ref};
+        die "key '$key' without a value in header" unless defined $value;
+        print "$key: $value\n";
+    }
+}
+
+sub render_content {
+    # render_empty_props is a boolean flag that tells us what to do in
+    # the case of there being no properties: do we omit any mention of
+    # the properties, or do we render empty properties?  Subversion
+    # sometimes does one and sometimes the other, so we let the client
+    # tell us which to do.
+    my ($propsref, $textref, $render_empty_props) = @_;
+    my $props_end = "PROPS-END\n";
+    my $props_end_length = length $props_end;
+
+    # count the lengths
+    # props
+    my $prop_content_length = 0;
+    for my $elt (@{$propsref}) {
+        my $elt_len = length $elt;
+        my $elt_len_str = sprintf("%d", $elt_len);
+        my $elt_len_len = length $elt_len_str;
+        # add 4 for the 'K ' and two newlines
+        my $elt_len_total = 4 + $elt_len + $elt_len_len;
+        $prop_content_length += $elt_len_total;
+    }
+    if ($prop_content_length > 0 || $render_empty_props) {
+        $prop_content_length += $props_end_length;
+    }
+    my $content_length += $prop_content_length;
+    # text
+    my $text_content_length;
+    if (defined $textref) {
+        $text_content_length = length ${$textref};
+        $content_length += $text_content_length;
+    }
+
+    # special case: get out if there is no content
+    if ($content_length == 0) { return }
+
+    # render the content metadata
+    if ($prop_content_length > 0 || $render_empty_props) {
+        print "Prop-content-length: $prop_content_length\n";
+    }
+    if (defined $text_content_length) {
+        print "Text-content-length: $text_content_length\n";
+    }
+    if (defined $textref) {
+        my $md5hex = md5_hex(${$textref});
+        print "Text-content-md5: $md5hex\n";
+    }
+    print "Content-length: $content_length\n";
+    render_newline();
+
+    # render properties
+    if ($prop_content_length > 0 || $render_empty_props) {
+        while (1) {
+            my $key = shift @{$propsref};
+            last unless defined $key; # done
+            my $key_length = length $key;
+            print "K $key_length\n$key\n";
+
+            my $value = shift @{$propsref};
+            die "no value for key $key" unless defined $value;
+            my $value_length = length $value;
+            print "V $value_length\n$value\n";
+        }
+        print $props_end;
+    }
+
+    # render text
+    if (defined $text_content_length) {
+        print ${$textref};
+    }
+}
+
+sub render_format_header {
+    # here I force the order so its ok to convert to a hash
+    my %format_headers0 = @format_headers;
+    render_header('SVN-fs-dump-format-version', \%format_headers0);
+    render_newline();
+    if ($format_headers0{'UUID'}) {
+        render_header('UUID', \%format_headers0);
+        render_newline();
+    }
+}
+
+# **** main
+
+eval {
+    read_command_line();
+    parse_svn_dumpdir();
+    print "done\n" if $comment;
+};
+if ($@) {
+    print "$@";
+    print_usage();
+    exit(1);                    # should autoflush
+}

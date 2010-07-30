@@ -1,0 +1,15 @@
+                            SVN Dump Tools
+                         Daniel S. Wilkerson
+
+File svn-dumpfile-grammar.txt is documentation for the grammar of an
+svn dumpfile.
+
+Tools svn-dump2dir and svn-dir2dump are utilities for easily hacking
+on the history of a subversion repository.
+
+Tool simple-patch is a simpler version of patch that you can control
+much more easily than Larry Wall's patch (written in Perl; I can hear
+Larry screaming).
+
+All software is released under the BSD license, which you can find in
+each program file.

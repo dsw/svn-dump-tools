@@ -1,0 +1,86 @@
+A Grammar for Subversion Dump Files
+
+Daniel S. Wilkerson
+
+**** Introduction:
+
+This is a grammar for the Subversion dump file format constructed from
+reading their documentation.
+
+**** Grammar format:
+
+  nonterminal -> definition
+
+A definition is a sequence of nonterminals, quoted terminals, or
+angle-bracket-quoted built-ins.  A '*' following something means 0 or
+more.  Something in square brackets is optional.  A built-in or
+nonterminal may be named by following it with a ':' and a name.
+
+The built-ins are:
+
+  <newline>: a newline
+
+  <newline-terminated-string>: a string up to the first newline
+
+  <digits>: a sequence of digits
+
+  <string>: a sequence of bytes
+
+  <named-digits "bytes of" nonterminal-name>: a sequence of bytes of
+length whatever number a <digits> parsed to; these then must also
+parse as the nonterminal "nonterminal-name"
+
+**** Grammar:
+
+svn-dumpfile -> format-header revision-list
+
+format-header -> version-string [<newline> uuid] <newline>
+
+version-string -> "SVN-fs-dump-format-version: " <digits>:format-version <newline>
+
+revision-list -> revision *
+
+revision -> revision-number revision-props <newline> node-list
+
+revision-number -> "Revision-number: " <digits>:revision-number <newline> 
+
+revision-props ->
+  "Prop-content-length: " <digits>:prop-content-length <newline>
+  "Content-length: " <digits>:prop-content-length /*again!*/ <newline> <newline> /*double*/
+  <prop-content-length bytes of property-data>
+
+property-data -> key-value-pair-list props-end
+
+key-value-pair-list -> key-value-pair *
+
+key-value-pair -> key value
+
+key -> "K " digit:key-length <newline> <key-length bytes of data> <newline>
+
+value -> "V " digit:value-length <newline> <value-length bytes of data> <newline>
+
+props-end -> "PROPS-END" <newline>
+
+node-list -> node *
+
+node -> node-header node-content <newline> <newline>
+
+node-header ->
+  Node-path: <newline-terminated-string>
+  Node-kind: "file" | "dir"
+  Node-action: "change" | "add" | "delete" | "replace"
+  [Node-copyfrom-rev: <newline-terminated-string>]
+  [Node-copyfrom-path: <newline-terminated-string>]
+
+node-content -> node-content-header node-content-body
+
+node-content-header ->
+  [Text-copy-source-md5: <newline-terminated-string>]
+  [Text-content-md5: <newline-terminated-string>]
+  [Text-content-length: <digits>:node-text-content-length]
+  [Prop-content-length: <digits>:node-prop-content-length]
+  Content-length: <digits>:node-content-length <newline> <newline> /*double*/
+
+node-content-body ->
+  <node-prop-content-length bytes of property-data>
+  <node-text-content-length bytes of <string> >

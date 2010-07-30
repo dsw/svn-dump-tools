@@ -1,0 +1,848 @@
+#!/usr/bin/perl -w
+# -*-perl-*-
+use strict;
+
+# Convert a subversion dump file to a subversion dump directory.
+# Daniel S. Wilkerson
+
+# **** license
+
+# Copyright (c) 2006 Regents of the University of California
+# All rights reserved.
+#
+# Redistribution and use in source and binary forms, with or without
+# modification, are permitted provided that the following conditions are
+# met:
+#
+#     Redistributions of source code must retain the above copyright
+#     notice, this list of conditions and the following disclaimer. 
+#     Redistributions in binary form must reproduce the above copyright
+#     notice, this list of conditions and the following disclaimer in the
+#     documentation and/or other materials provided with the
+#     distribution.
+#
+#     Neither the name of the University of California, Berkeley nor the
+#     names of its contributors may be used to endorse or promote
+#     products derived from this software without specific prior written
+#     permission.
+#
+# THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+# "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+# LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+# A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+# OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+# SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+# LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+# DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+# THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+# (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+# OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+# **** schema presentation in the filesystem
+
+# schema map from dump file to directory:
+# dump file -> directory containing:
+#   file "Readme" saying what is going on
+#   file "Metadata" of meta-data
+#   file "Headers" of header-data
+#   directories "revision-N" of revisions
+# revision-N -> directory containing:
+#   files "Rev-prop-M-key" with revision property M key
+#   files "Rev-prop-M-value" with revision property M value
+#   files "node-K-headers" with node K headers and values
+#   files "node-K-prop-M-key" with node K property M key
+#   files "node-K-prop-M-value" with node K property M value
+#   directory "text" of node K text
+# text -> directory containing:
+#   files named by the node K node-path containing the node K text
+
+# Note that the upper/lower case of the names are carefully chosen so
+# that the files/directories sort asciibetically in the order shown.
+
+# **** FIX
+
+# deal with unknown headers missing for the revision
+
+# the two sets of headers for nodes should be merged so that I can
+# deal with them coming in any order and with unknown ones missing
+
+# it would be handy if the property "-key" files had a hint of the
+# property name at the tail of the filename; first 5 alphanums or
+# something
+
+# "Text-copy-source-md5": what the hell does this field mean?  Can't
+# understand the documentation.  Don't know if I should preserve it or
+# recalculate it, so I omit it deliberately.
+
+# ****************
+
+my $creator = "svn-dump2dir";
+my $version = "1.0:2006-08-15";
+my $author = "Daniel S. Wilkerson";
+my $readme = << "END0";
+This directory is a subversion dump file converted into directory form
+for more easy manipulation.  The conversion program was ${creator}
+verison ${version} by ${author}.
+END0
+    ;
+
+# command-line flags
+my $target;                     # name of target dir
+my $renumber_revisions;         # renumber the revisions starting at 0
+my $skip_nodepath_re;           # regex for node paths to skip
+my $num_digits = 4;             # num digits in a number in a filename
+my $verbose;                    # dump objects as the are complete
+my $verbose_text;               # dump node text; it is much longer
+my $comment;                    # comment on the current parsing state
+
+# misc global state
+#
+# the following error message suggests that the revision numbers
+# should not start at 0: 'svnadmin: Malformed dumpstream: Revision 0
+# must not contain node records'
+my $next_revision_number = 1; # the next number to use when renumbering revisions
+
+# private buffer for get_line
+my $line;
+my $pushback;                   # bool: return $line again next time get_line is asked?
+my $bytes_read = 0;             # bytes read
+
+# rendering state
+my $node_header_counter;
+
+# format properties
+my $format_version;
+my $uuid;
+
+# revision properties
+my $revision_number;
+my $prop_content_length;
+my @revision_props;
+
+# node properties
+my $node_path;
+my $node_kind;
+my $node_action;
+my $node_copyfrom_rev;
+my $node_copyfrom_path;
+my @node_props;
+
+# node content
+my $text_copy_source_md5;
+my $text_content_md5;
+my $node_text_content_length;
+my $node_prop_content_length; # a bit out of place, but this is how it parses
+my $node_text_content;
+
+# **** utilities
+
+# print a number for use in a filename; basically, make it fixed-width
+# so that asciibetical order and numberical order are the same
+sub filenum {
+    my ($num) = @_;
+    die "no number!" unless defined $num;
+    return sprintf("%0${num_digits}d", $num);
+}
+
+# ensure that the argument file can be opened for writing in the file
+# system by making all of the directories on the way down to it; mkdir
+# --parents would do the same and there is some Perl module for this
+# also, but I don't want the dependencies on either
+sub ensure_path_to {
+    my ($path) = @_;
+
+    # if there is no slash, there is nothing to do and it would mess
+    # up the code below
+    if ($path !~ m|/|) { return }
+
+    # if the path starts with a slash, be sure to prepend that to all
+    # the pathnames reconstructed after the split; if not, don't as
+    # join won't prepend with the delimiter char
+    my $initial;
+    if ($path =~ m|^/|) {
+        $initial = '/';
+    } else {
+        $initial = '';
+    }
+
+    # delete everything after the last slash in the path so that we
+    # only have a path to the directory; if the last character is a
+    # slash, this does nothing which is the right thing
+    $path =~ s|/[^/]*$|/|;
+
+    # make all of the prefix paths to the path
+    my @parts = split /\//, $path;
+    for(my $i=0; $i<@parts; ++$i) {
+        my $prefix = $initial . join('/', @parts[0..$i]) . '/';
+        if (-f $prefix) {
+            die "can't make directory because it is a file already: $prefix";
+        }
+        # make it if it doesn't exist
+        if (! -d $prefix) {
+            mkdir $prefix or die "can't make path $prefix: $!\n";
+        }
+    }
+}
+
+# **** read command line
+
+sub print_usage {
+    print << "END0";
+usage $0: [flags] < svn-dump-file
+where flags are:
+  --help or -h        : print this message
+  --target=target-dir : the target directory; if omitted, nothing is rendered
+  --renumber-revisions     : renumber the revisions starting at 1
+  --skip-nodepath-re=REGEX : regular expression for node paths to skip
+  --num-digits=num    : number of digits in a number in a filename [${num_digits}]
+  --verbose           : print out contents as parse
+  --verbose-text      : if verbose, also print node text; much more output
+  --comment           : comment on program state
+END0
+;
+}
+
+sub read_command_line {
+    while(@ARGV) {
+        my $arg = shift @ARGV;
+        if (0) {                # orthogonality
+        } elsif ($arg =~ m/^--target=(.*)$/) {
+            die "target already defined" if defined $target;
+            $target = $1;
+        } elsif ($arg =~ m/^--num-digits=(.*)$/) {
+            $num_digits = $1;
+        } elsif ($arg =~ m/^--renumber-revisions$/) {
+            ++$renumber_revisions;
+        } elsif ($arg =~ m/^--skip-nodepath-re=(.*)$/) {
+            $skip_nodepath_re = $1;
+        } elsif ($arg =~ m/^-h$/) {
+            print_usage();
+            exit(1);
+        } elsif ($arg =~ m/^--help$/) {
+            print_usage();
+            exit(1);
+        } elsif ($arg =~ m/^--verbose$/) {
+            ++$verbose;
+        } elsif ($arg =~ m/^--verbose-text$/) {
+            ++$verbose_text;
+        } elsif ($arg =~ m/^--comment$/) {
+            ++$comment;
+        } else {
+            die "illegal command line argument: $arg\n";
+        }
+    }
+    # check integrity of state
+    if ($target) {
+        die "target already exists: $target\n" if -e $target;
+    }
+}
+
+# **** read input
+
+sub read_one_line {
+    if (eof STDIN) {
+        die "control -- end of file";
+    }
+    $line = <STDIN>;            # actually read a line
+    $bytes_read += length $line;
+}
+
+# get a string with a line of pushback
+sub get_line {
+    if ($pushback) {
+        undef $pushback;        # pushback gets false
+        die "internal error -- pushed back undef line" unless defined $line;
+        # don't read a line; return $line again
+    } else {
+        read_one_line();
+    }
+    return $line;
+};
+
+sub pushback {
+    my ($message) = @_;
+    # sometimes we do have to pushback a blank line
+#    die "$bytes_read: attempted to push back a blank line:$message\n" if $line =~ m/^$/m;
+    $pushback = 1;
+    die "pushback -- $message";
+};
+
+sub check_final_state {
+    if ($pushback) {
+        die "$bytes_read: terminated while pushback line remains:$line:\n";
+    }
+    if (!eof STDIN) {
+        die "$bytes_read: terminated before EOF on STDIN\n";
+    }
+}
+
+# expect a blank line
+sub parse_newline {
+    get_line() =~ m/^\n$/ or die "$bytes_read: format error";
+}
+
+# **** clear state
+
+sub clear_format_header {
+    undef $format_version;
+    undef $uuid;
+}
+
+sub clear_revision_header {
+    undef $revision_number;
+    undef $prop_content_length;
+    undef @revision_props;
+};
+
+sub clear_node_header {
+    undef $node_path;
+    undef $node_kind;
+    undef $node_action;
+    undef $node_copyfrom_rev;
+    undef $node_copyfrom_path;
+    undef @node_props;
+}
+
+sub clear_node_content {
+    undef $text_copy_source_md5;
+    undef $text_content_md5;
+    undef $node_text_content_length;
+    undef $node_prop_content_length;
+    undef $node_text_content;
+};
+
+# **** print state
+
+sub print_props {
+    my ($props_ref) = @_;
+    while(1) {
+        my $key = shift @{$props_ref};
+        last unless defined $key;
+        my $value = shift @{$props_ref};
+        die "odd number of props" unless defined $value;
+        print "\t\t'$key' == '$value'\n";
+    }
+}
+
+sub print_format_header {
+    print ">>>> format header\n";
+    print "\tformat_version: $format_version\n";
+    print "\tuuid: $uuid\n";
+    print "<<<< end format header\n";
+}
+
+sub print_revision_header {
+    print ">>>> revision header\n";
+    print "\trevision_number: $revision_number\n";
+    print "\tprop_content_length: $prop_content_length\n";
+    if (@revision_props) {
+        print "\trevision_props:\n";
+        print_props(\@revision_props);
+    }
+    print "<<<< end revision header\n";
+};
+
+sub print_node_header {
+    print ">>>> node header\n";
+    print "\tnode_path: $node_path\n";
+    print "\tnode_kind: $node_kind\n";
+    print "\tnode_action: $node_action\n";
+    print "\tnode_copyfrom_rev: $node_copyfrom_rev\n"
+        if defined $node_copyfrom_rev;
+    print "\tnode_copyfrom_path: $node_copyfrom_path\n"
+        if defined $node_copyfrom_path;
+    if (@node_props) {
+        print "\tnode_props:\n";
+        print_props(\@node_props);
+    }
+    print "<<<< end node header\n";
+}
+
+sub print_node_content {
+    print ">>>> node content\n";
+    print "\ttext_copy_source_md5: $text_copy_source_md5\n"
+        if defined $text_copy_source_md5;
+    print "\ttext_content_md5: $text_content_md5\n"
+        if defined $text_content_md5;
+    print "\tnode_text_content_length: $node_text_content_length\n"
+        if defined $node_text_content_length;
+    print "\tnode_prop_content_length: $node_prop_content_length\n"
+        if defined $node_prop_content_length;
+    if ($verbose_text) {
+        print "\tnode_text_content: $node_text_content\n";
+    }
+    print "<<<< end node content\n";
+};
+
+# **** render
+
+sub render_props {
+    my ($revdir, $prefix, $props_ref) = @_;
+    die unless defined $revdir;
+    die unless -d $revdir;
+    die unless defined $prefix;
+    die unless defined $props_ref;
+    my $prop_number = 0;
+    while (1) {
+        my $prop_num_str = filenum($prop_number);
+
+        # key
+        my $key = shift @{$props_ref};
+        last unless defined $key;
+        my $key_file = "${revdir}/${prefix}-${prop_num_str}-key";
+        die if -e $key_file;
+        open  FH_PROP_KEY, ">$key_file" or die $!;
+        print FH_PROP_KEY $key;
+        close FH_PROP_KEY or die $!;
+
+        # value
+        my $value = shift @{$props_ref};
+        die "odd number of props" unless defined $value;
+        my $value_file = "${revdir}/${prefix}-${prop_num_str}-value";
+        die if -e $value_file;
+        open  FH_PROP_VALUE, ">$value_file" or die $!;
+        print FH_PROP_VALUE $value;
+        close FH_PROP_VALUE or die $!;
+
+        # increment
+        ++$prop_number;
+    }
+}
+
+sub render_format_header {
+    die "internal error -- no target" unless $target;
+    die "internal error -- target exists" if -e $target;
+    mkdir $target or die $!;
+
+    open  FH_README, ">$target/Readme" or die $!;
+    print FH_README $readme;
+    close FH_README or die $!;
+
+    open  FH_METADATA, ">$target/Metadata" or die $!;
+    print FH_METADATA "creator: $creator\n";
+    print FH_METADATA "version: $version\n";
+    close FH_METADATA or die $!;
+
+    open  FH_HEADERS, ">$target/Headers" or die $!;
+    print FH_HEADERS "SVN-fs-dump-format-version: $format_version\n";
+    print FH_HEADERS "UUID: $uuid\n";
+    close FH_HEADERS or die $!;
+}
+
+sub render_revision_header {
+    die unless $target;
+    my $revision_number_str = filenum($revision_number);
+    my $revdir = "$target/revision-$revision_number_str";
+    mkdir $revdir or die $!;
+    if (@revision_props) {
+        render_props($revdir, "Rev-prop", \@revision_props);
+    }
+    my $textdir = "$target/revision-$revision_number_str/text";
+    mkdir $textdir or die "can't make directory $textdir: $!\n";
+    $node_header_counter = 0;
+};
+
+sub render_node {
+    die unless $target;
+    die unless defined $revision_number;
+    my $revision_number_str = filenum($revision_number);
+    my $revdir = "$target/revision-$revision_number_str";
+
+    # headers
+    die unless defined $node_header_counter;
+    my $node_header_counter_str = filenum($node_header_counter);
+    my $node_headers_file = "${revdir}/node-${node_header_counter_str}-headers";
+    open  FH_HEADERS, ">$node_headers_file" or die $!;
+    die unless defined $node_path;
+    print FH_HEADERS "Node-path: $node_path\n";
+    print FH_HEADERS "Node-kind: $node_kind\n"
+        if defined $node_kind;
+    print FH_HEADERS "Node-action: $node_action\n"
+        if defined $node_action;
+    print FH_HEADERS "Node-copyfrom-rev: $node_copyfrom_rev\n"
+        if defined $node_copyfrom_rev;
+    print FH_HEADERS "Node-copyfrom-path: $node_copyfrom_path\n"
+        if defined $node_copyfrom_path;
+    close FH_HEADERS or die $!;
+
+    # properties
+    if (@node_props) {
+        render_props($revdir, "node-${node_header_counter_str}-prop", \@node_props);
+    }
+
+    # content
+    if (defined $node_text_content) {
+        die "node_kind is dir and also has node_text_content"
+            if defined $node_kind && $node_kind eq 'dir';
+        # See note above in FIX section; I don't understand this so I omit it
+        # deliberately.
+        #     print "\ttext_copy_source_md5: $text_copy_source_md5\n"
+        #         if defined $text_copy_source_md5;
+        # These are recalculated.
+        #     print "\ttext_content_md5: $text_content_md5\n"
+        #         if defined $text_content_md5;
+        #     print "\tnode_text_content_length: $node_text_content_length\n"
+        #         if defined $node_text_content_length;
+        #     print "\tnode_prop_content_length: $node_prop_content_length\n"
+        #         if defined $node_prop_content_length;
+        my $textdir = "$target/revision-$revision_number_str/text";
+        my $node_text_file = "$textdir/$node_path";
+        ensure_path_to($node_text_file);
+        open  FH_TEXT, ">$node_text_file" or die $!;
+        print FH_TEXT $node_text_content;
+        close FH_TEXT or die $!;
+    }
+    if (defined $node_kind && $node_kind eq 'dir') {
+        my $textdir = "$target/revision-$revision_number_str/text";
+        my $node_text_file = "$textdir/$node_path";
+        ensure_path_to("${node_text_file}/");
+    }
+
+    # increment
+    ++$node_header_counter;
+};
+
+# **** parse
+
+# svn-dumpfile -> format-header revision-list
+sub parse_svn_dumpfile {
+    parse_format_header();
+    print_format_header() if $verbose;
+    render_format_header() if $target;
+
+    parse_revision_list();
+}
+
+# format-header -> version-string [<newline> uuid] <newline>
+# version-string -> "SVN-fs-dump-format-version: " <digits>:format-version <newline>
+sub parse_format_header {
+    clear_format_header();
+    get_line() =~ m/^SVN-fs-dump-format-version: ([0-9]+)\n$/ or die "$bytes_read: format error";
+    $format_version = $1;
+    if ($format_version > 1) {
+        parse_newline();
+        get_line() =~ m/^UUID: (.*)\n$/ or die "$bytes_read: format error";
+        $uuid = $1;
+    }
+    parse_newline();
+}
+
+# revision-list -> revision *
+sub parse_revision_list {
+    print "parse revision list\n" if $comment;
+    eval {
+        while(1) {
+            parse_revision();
+        }
+    };
+    if ($@) {
+        if ($@ =~ m/^pushback -- not Revision-number/) {
+            print "end of revision list:$line:\n" if $comment;
+        } elsif ($@ =~ m/^control -- end of file/) {
+            # nothing to do
+            print "end of file\n" if $comment;
+        } else {
+            die $@;
+        }
+    }
+}
+
+# revision -> revision-number revision-props <newline> node-list
+sub parse_revision {
+    print "**************************************************************** $bytes_read: parse_revision\n" if $comment;
+    clear_revision_header();
+
+    parse_revision_number();
+    parse_revision_props();
+    print "about to parse end of revision newline\n" if $comment;
+    parse_newline();
+    print_revision_header() if $verbose;
+    render_revision_header() if $target;
+
+    parse_node_list();
+}
+
+# revision-number -> "Revision-number: " <digits>:revision-number <newline>
+sub parse_revision_number {
+    get_line() =~ m/^Revision-number: ([0-9]+)\n$/ or pushback("not Revision-number");
+    $revision_number = $1;
+    if ($renumber_revisions) {
+        $revision_number = $next_revision_number++;
+    }
+}
+
+# revision-props ->
+#   "Prop-content-length: " <digits>:prop-content-length <newline>
+#   "Content-length: " <digits>:prop-content-length /*again!*/ <newline> <newline> /*double*/
+#   <prop-content-length bytes of property-data>
+sub parse_revision_props {
+    get_line() =~ m/^Prop-content-length: ([0-9]+)\n$/ or die "$bytes_read: format error";
+    $prop_content_length = $1;
+    get_line() =~ m/^Content-length: ([0-9]+)\n$/ or die "$bytes_read: format error";
+    my $content_length = $1;
+    die "$bytes_read: format error -- revision prop content lengths don't match"
+        unless $prop_content_length == $content_length;
+    parse_newline();
+    die "state error -- should be no pending pushback" if $pushback;
+    my $property_data;
+    read STDIN, $property_data, $content_length;
+    die unless $content_length == length $property_data;
+    $bytes_read += $content_length;
+    @revision_props = parse_property_data($property_data);
+    print "$bytes_read: done parse_revision_props\n" if $comment;
+}
+
+# property-data -> key-value-pair-list props-end
+# props-end -> "PROPS-END" <newline>
+sub parse_property_data {
+    print "parse_property_data\n" if $comment;
+    my ($input) = @_;
+    unless (defined $input) {
+        die "internal error -- input undefined";
+    }
+    $input =~ m/^(.*)PROPS-END\n$/s or die "$bytes_read: format error";
+    my $input2 = $1;
+    my @ret = parse_key_value_pair_list($input2);
+    print "END parse_property_data\n" if $comment;
+    return @ret;
+}
+
+# key-value-pair-list -> key-value-pair *
+sub parse_key_value_pair_list {
+    my ($input) = @_;
+    print "parse_key_value_pair_list:$input:\n" if $comment;
+    my @result;
+    eval {
+        while(1) {
+            # key_value_pair -> key value
+            # key -> "K " digit:key-length <newline> <key-length bytes of data> <newline>
+            # NOTE: do not say pushback() here; we have already read the input
+            $input =~ m/\GK ([0-9]+)\n/g or die("control -- not K");
+            my $key_len = $1;
+            $input =~ m/\G(.{$key_len})\n/sg or die "$bytes_read: format error";
+            my $key = $1;
+            print "\tkey:$key:\n" if $comment;
+            # value -> "V " digit:value-length <newline> <value-length bytes of data> <newline>
+            $input =~ m/\GV ([0-9]+)\n/g or die "$bytes_read: format error";
+            my $value_len = $1;
+            $input =~ m/\G(.{$value_len})\n/sg or die "$bytes_read: format error";
+            my $value = $1;
+            print "\tvalue:$value:\n" if $comment;
+            push @result, $key, $value;
+        }
+    };
+    if ($@) {
+        if ($@ =~ m/^control -- not K/) {
+            print "end of key-value pair list:$line:\n" if $comment;
+        } else {
+            die $@;
+        }
+    }
+    return @result;
+}
+
+# node-list -> node *
+sub parse_node_list {
+    print "parse_node_list\n" if $comment;
+    eval {
+        while(1) {
+            parse_node();
+        }
+    };
+    if ($@) {
+        if ($@ =~ m/^pushback -- not Node-path/) {
+            print "end of node list:$line:\n" if $comment;
+        } else {
+            die $@;
+        }
+    }
+}
+
+# node -> node-header node-content <newline> <newline>
+sub parse_node {
+    print "**************** $bytes_read: parse_node\n" if $comment;
+    parse_node_header();
+    eval {
+        parse_node_content();
+    };
+    if ($@) {
+        if ($@ =~ m/^pushback -- no node content headers/) {
+            print "no node content headers:$line:\n" if $comment;
+        } else {
+            die $@;
+        }
+    }
+
+    parse_newline();
+    parse_newline();
+
+    if ($skip_nodepath_re && $node_path =~ m/$skip_nodepath_re/) {
+        warn "skipping Node-path:'$node_path' because matches " .
+            "skip-nodepath-re '$skip_nodepath_re'";
+    } else {
+        print_node_header() if $verbose;
+        print_node_content() if $verbose;
+        render_node() if $target;
+    }
+}
+
+# node-header ->
+#   Node-path: <newline-terminated-string>
+#   Node-kind: "file" | "dir"
+#   Node-action: "change" | "add" | "delete" | "replace"
+#   [Node-copyfrom-rev: <newline-terminated-string>]
+#   [Node-copyfrom-path: <newline-terminated-string>]
+sub parse_node_header {
+    print "parse_node_header\n" if $comment;
+    clear_node_header();
+    get_line() =~ m/^Node-path: (.*)\n$/ or pushback("not Node-path");
+    $node_path = $1;
+    print "node_path:$node_path\n" if $comment;
+
+    eval {
+        while(1) {
+            get_line();         # read from $line below
+            if (0) {            # orthogonality
+            } elsif ($line =~ m/^Node-kind: (.*)\n$/) {
+                $node_kind = $1;
+            } elsif ($line =~ m/^Node-action: (.*)\n$/) {
+                $node_action = $1;
+            } elsif ($line =~ m/^Node-copyfrom-rev: (.*)\n$/) {
+                $node_copyfrom_rev = $1;
+            } elsif ($line =~ m/^Node-copyfrom-path: (.*)\n$/) {
+                $node_copyfrom_path = $1;
+            } elsif ($line =~ m/^Text-content-md5: (.*)\n$/) {
+                # HACK: the svndumpfilter puts the Text-content-md5
+                # sooner than it seems that it should go
+                $text_content_md5 = $1;
+            } else {
+                pushback("not node header");
+            }
+        }
+    };
+    if ($@) {
+        if ($@ =~ m/^pushback -- not node header/) {
+            # check the mandatory headers are there
+            die "$bytes_read: Node-path omitted" unless defined $node_path;
+            # the documentation says that the Node-kind is mandatory,
+            # however sometimes it is omitted
+#            die "$bytes_read: Node-kind omitted" unless defined $node_kind;
+            die "$bytes_read: Node-action omitted" unless defined $node_action;
+            print "end of node header:$line:\n" if $comment;
+        } else {
+            die $@;
+        }
+    }
+}
+
+# node-content -> node-content-header node-content-body
+sub parse_node_content {
+    print "parse_node_content\n" if $comment;
+    clear_node_content();
+    parse_node_content_header();
+    parse_node_content_body();
+}
+
+# node-content-header ->
+#   [Text-copy-source-md5: <newline-terminated-string>]
+#   [Text-content-md5: <newline-terminated-string>]
+#   [Text-content-length: <digits>:node-text-content-length]
+#   [Prop-content-length: <digits>:node-prop-content-length]
+#   Content-length: <digits>:node-content-length <newline> <newline> /*double*/
+sub parse_node_content_header {
+    eval {
+        while(1) {
+            get_line();         # read from $line below
+            if (0) {            # orthogonality
+            } elsif ($line =~ m/^Text-copy-source-md5: (.*)\n$/) {
+                $text_copy_source_md5 = $1;
+            } elsif ($line =~ m/^Text-content-md5: (.*)\n$/) {
+                $text_content_md5 = $1;
+            } elsif ($line =~ m/^Text-content-length: (.*)\n$/) {
+                $node_text_content_length = $1;
+            } elsif ($line =~ m/^Prop-content-length: (.*)\n$/) {
+                $node_prop_content_length = $1;
+            } elsif ($line =~ m/^Content-length: (.*)\n$/) {
+                pushback("start node header content length");
+            } elsif ($line =~ m/^[-a-zA-Z]*: .*\n$/) {
+                # "unknown headers are always ignored, for backwards compatibility"
+            } elsif ($line =~ m/^\n$/) {
+                # blank line means that there are NO node content
+                # headers at all because there is no node content
+                pushback("no node content headers");
+            } else {
+                die "format error -- node header can't end with this line: $line";
+            }
+        }
+    };
+    if ($@) {
+        if ($@ =~ m/^pushback -- start node header content length/) {
+            # NOTE: no headers to check are defined as all are optinal
+            print "end of node content header:$line:\n" if $comment;
+        } else {
+            die $@;
+        }
+    }
+    get_line() =~ m/^Content-length: (.*)\n$/ or die "$bytes_read: format error";
+    my $content_length = $1;
+
+    # check the lengths add up if we have enough of them to check
+    my $temp_total = 0;
+    my $has_prop_or_text_cl;
+    if (defined $node_prop_content_length) {
+        $temp_total+= $node_prop_content_length;
+        ++$has_prop_or_text_cl;
+    }
+    if (defined $node_text_content_length) {
+        $temp_total+= $node_text_content_length;
+        ++$has_prop_or_text_cl;
+    }
+    if ($has_prop_or_text_cl) {
+        die "$bytes_read: format error -- node prop content lengths don't match"
+            unless $temp_total == $content_length;
+    }
+
+    parse_newline();
+}
+
+# node-content-body ->
+#   <node-prop-content-length bytes of property-data>
+#   <node-text-content-length bytes of <string> >
+sub parse_node_content_body {
+    print "parse_node_content_body\n" if $comment;
+    # parse node props
+    if (defined $node_prop_content_length) {
+        die "state error -- should be no pending pushback" if $pushback;
+        my $node_prop_content;
+        read STDIN, $node_prop_content, $node_prop_content_length;
+        die unless $node_prop_content_length == length $node_prop_content;
+        $bytes_read += $node_prop_content_length;
+        @node_props = parse_property_data($node_prop_content);
+    }
+
+    # parse node text
+    if (defined $node_text_content_length) {
+        die "state error -- should be no pending pushback" if $pushback;
+        read STDIN, $node_text_content, $node_text_content_length;
+        die unless $node_text_content_length == length $node_text_content;
+        $bytes_read += $node_text_content_length;
+    }
+    print "END parse_node_content_body\n" if $comment;
+}
+
+# **** main
+
+eval {
+    read_command_line();
+    if ($comment) {
+        print "target: " . ($target ? $target : "<NONE>") . "\n";
+    }
+    parse_svn_dumpfile();
+    check_final_state();
+    print "done\n" if $comment;
+};
+if ($@) {
+    print "$@";
+    print_usage();
+    exit(1);
+}
