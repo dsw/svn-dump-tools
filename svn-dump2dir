@@ -130,6 +130,7 @@ my @node_props;
 # node content
 my $text_copy_source_md5;
 my $text_content_md5;
+my $text_content_sha1;
 my $node_text_content_length;
 my $node_prop_content_length; # a bit out of place, but this is how it parses
 my $node_text_content;
@@ -306,6 +307,7 @@ sub clear_node_header {
 sub clear_node_content {
     undef $text_copy_source_md5;
     undef $text_content_md5;
+    undef $text_content_sha1;
     undef $node_text_content_length;
     undef $node_prop_content_length;
     undef $node_text_content;
@@ -364,6 +366,8 @@ sub print_node_content {
         if defined $text_copy_source_md5;
     print "\ttext_content_md5: $text_content_md5\n"
         if defined $text_content_md5;
+    print "\ttext_content_sha1: $text_content_sha1\n"
+        if defined $text_content_sha1;
     print "\tnode_text_content_length: $node_text_content_length\n"
         if defined $node_text_content_length;
     print "\tnode_prop_content_length: $node_prop_content_length\n"
@@ -481,6 +485,8 @@ sub render_node {
         # These are recalculated.
         #     print "\ttext_content_md5: $text_content_md5\n"
         #         if defined $text_content_md5;
+        #     print "\ttext_content_sha1: $text_content_sha1\n"
+        #         if defined $text_content_sha1;
         #     print "\tnode_text_content_length: $node_text_content_length\n"
         #         if defined $node_text_content_length;
         #     print "\tnode_prop_content_length: $node_prop_content_length\n"
@@ -715,6 +721,10 @@ sub parse_node_header {
                 # HACK: the svndumpfilter puts the Text-content-md5
                 # sooner than it seems that it should go
                 $text_content_md5 = $1;
+            } elsif ($line =~ m/^Text-content-sha1: (.*)\n$/) {
+                # HACK: the svndumpfilter puts the Text-content-sha1
+                # sooner than it seems that it should go
+                $text_content_sha1 = $1;
             } else {
                 pushback("not node header");
             }
@@ -758,6 +768,8 @@ sub parse_node_content_header {
                 $text_copy_source_md5 = $1;
             } elsif ($line =~ m/^Text-content-md5: (.*)\n$/) {
                 $text_content_md5 = $1;
+            } elsif ($line =~ m/^Text-content-sha1: (.*)\n$/) {
+                $text_content_sha1 = $1;
             } elsif ($line =~ m/^Text-content-length: (.*)\n$/) {
                 $node_text_content_length = $1;
             } elsif ($line =~ m/^Prop-content-length: (.*)\n$/) {
